@@ -26,7 +26,9 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/rakyll/boom/boomer"
+	"boom/boomer"
+	"github.com/labstack/gommon/color"
+	"path/filepath"
 )
 
 const (
@@ -42,10 +44,11 @@ var (
 	contentType = flag.String("T", "text/html", "")
 	authHeader  = flag.String("a", "", "")
 
-	output = flag.String("o", "", "")
+	output   = flag.String("o", "", "")
+	bodyFile = flag.String("i", "", "")
 
 	c    = flag.Int("c", 50, "")
-	n    = flag.Int("n", 200, "")
+	n    = flag.Int("n", -1, "")
 	q    = flag.Int("q", 0, "")
 	t    = flag.Int("t", 0, "")
 	cpus = flag.Int("cpus", runtime.GOMAXPROCS(-1), "")
@@ -67,6 +70,7 @@ Options:
       "csv" is the only supported alternative. Dumps the response
       metrics in comma-seperated values format.
 
+  -i  Request body from file
   -m  HTTP method, one of GET, POST, PUT, DELETE, HEAD, OPTIONS.
   -h  Custom HTTP headers, name1:value1;name2:value2.
   -t  Timeout in ms.
@@ -115,8 +119,20 @@ func main() {
 	conc := *c
 	q := *q
 
-	if num <= 0 || conc <= 0 {
-		usageAndExit("n and c cannot be smaller than 1.")
+	if conc <= 0 {
+		usageAndExit("c cannot be smaller than 1.")
+	}
+
+	if num > 0 && num < conc+2 {
+		usageAndExit("should n >= c+2.")
+	}
+
+	if *bodyFile == "" && num <= 0 {
+		num = 50 // default...
+	}
+
+	if _, err := os.Stat(*bodyFile); err != nil {
+		usageAndExit("-i input file not exist.")
 	}
 
 	var (
@@ -157,9 +173,12 @@ func main() {
 		username, password = match[1], match[2]
 	}
 
-	if *output != "csv" && *output != "" {
+	// TODO
+	/*
+	if *output != "" {
 		usageAndExit("Invalid output type.")
 	}
+	*/
 
 	var proxyURL *gourl.URL
 	if *proxyAddr != "" {
@@ -170,6 +189,29 @@ func main() {
 		}
 	}
 
+	abspath, _ := filepath.Abs(*bodyFile)
+	// print options
+	fmt.Println(color.Blue(":......................................:"))
+	fmt.Println(color.Blue("URL:"), url)
+	fmt.Println(color.Blue("Method:"), method)
+	fmt.Println(color.Blue("Body:"), *body)
+	fmt.Println(color.Blue("Header:"), *headers)
+	fmt.Println(color.Blue("Username:"), username)
+	fmt.Println(color.Blue("Password:"), password)
+	fmt.Println(color.Blue("OriginalHost:"), originalHost)
+	fmt.Println(color.Blue("Number of requests to run:"), num)
+	fmt.Println(color.Blue("Number of concurrency:"), conc)
+	fmt.Println(color.Blue("QPS:"), q)
+	fmt.Println(color.Blue("Timeout:"), *t)
+	fmt.Println(color.Blue("AllowInsecure:"), *insecure)
+	fmt.Println(color.Blue("DisableCompression:"), *disableCompression)
+	fmt.Println(color.Blue("DisableKeepAlives:"), *disableKeepAlives)
+	fmt.Println(color.Blue("ProxyAddr:"), *proxyAddr)
+	fmt.Println(color.Blue("Output:"), *output)
+	fmt.Println(color.Blue("BodyFile:"), abspath)
+	fmt.Println(color.Blue(":......................................:"))
+
+	reader := boomer.NewReader(*bodyFile)
 	(&boomer.Boomer{
 		Req: &boomer.ReqOpts{
 			Method:       method,
@@ -189,6 +231,8 @@ func main() {
 		DisableKeepAlives:  *disableKeepAlives,
 		ProxyAddr:          proxyURL,
 		Output:             *output,
+		BodyFile:           abspath,
+		BodyReader:         reader,
 	}).Run()
 }
 

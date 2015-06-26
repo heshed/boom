@@ -18,111 +18,165 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"github.com/labstack/gommon/color"
 )
 
 const (
 	barChar = "∎"
 )
 
-type report struct {
+type stat struct {
 	avgTotal float64
 	fastest  float64
 	slowest  float64
 	average  float64
 	rps      float64
 
-	results chan *result
-	total   time.Duration
+	total time.Duration
 
 	errorDist      map[string]int
+	errorCount     Counter
 	statusCodeDist map[int]int
 	lats           []float64
 	sizeTotal      int64
+	tick           int
+}
+
+func NewStat(tick int) *stat {
+	return &stat{
+		statusCodeDist: make(map[int]int),
+		errorDist:      make(map[string]int),
+		tick:           tick,
+	}
+}
+
+type report struct {
+	second *stat
+	half   *stat
+	total  *stat
 
 	output string
 }
 
-func printReport(size int, results chan *result, output string, total time.Duration) {
-	r := &report{
-		output:         output,
-		results:        results,
-		total:          total,
-		statusCodeDist: make(map[int]int),
-		errorDist:      make(map[string]int),
+func NewReport() *report {
+	return &report{
+		second: NewStat(1),
+		half:   NewStat(30),
+		total:  NewStat(-1),
 	}
-	r.finalize()
 }
 
-func (r *report) finalize() {
+func (r *report) clear(s *stat) {
+	s.avgTotal = 0
+	s.fastest = 0
+	s.slowest = 0
+	s.average = 0
+	s.rps = 0
+
+	s.total = 0
+
+	s.lats = []float64{}
+	s.sizeTotal = 0
+}
+
+func (r *report) Run(shutdown <-chan bool, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ticker := time.NewTicker(time.Second)
+	ticker30 := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	r.printColumns()
 	for {
 		select {
-		case res := <-r.results:
-			if res.err != nil {
-				r.errorDist[res.err.Error()]++
-			} else {
-				r.lats = append(r.lats, res.duration.Seconds())
-				r.avgTotal += res.duration.Seconds()
-				r.statusCodeDist[res.statusCode]++
-				if res.contentLength > 0 {
-					r.sizeTotal += res.contentLength
-				}
+		case <-shutdown:
+			r.printStatusCodes()
+			r.printHistogram()
+			r.printLatencies()
+			if r.total.errorCount.Val() > 0 {
+				r.printErrors()
 			}
-		default:
-			r.rps = float64(len(r.lats)) / r.total.Seconds()
-			r.average = r.avgTotal / float64(len(r.lats))
-			r.print()
 			return
+		case <-ticker.C:
+			r.printStat(r.second)
+			r.clear(r.second)
+
+		case <-ticker30.C:
+			r.printStat(r.half)
+			r.clear(r.half)
+			r.printColumns()
 		}
 	}
 }
 
-func (r *report) print() {
-	sort.Float64s(r.lats)
+func (r *report) printColumns() {
+	fmt.Println("\n :..:..:..:   Avg.Count   Avg.Res(ms)   fails   Fastest(ms)   Slowest(ms)   Avg.Res.Size")
+}
 
-	if r.output == "csv" {
-		r.printCSV()
-		return
-	}
-
-	if len(r.lats) > 0 {
-		r.fastest = r.lats[0]
-		r.slowest = r.lats[len(r.lats)-1]
-		fmt.Printf("\nSummary:\n")
-		fmt.Printf("  Total:\t%4.4f secs.\n", r.total.Seconds())
-		fmt.Printf("  Slowest:\t%4.4f secs.\n", r.slowest)
-		fmt.Printf("  Fastest:\t%4.4f secs.\n", r.fastest)
-		fmt.Printf("  Average:\t%4.4f secs.\n", r.average)
-		fmt.Printf("  Requests/sec:\t%4.4f\n", r.rps)
-		if r.sizeTotal > 0 {
-			fmt.Printf("  Total Data Received:\t%d bytes.\n", r.sizeTotal)
-			fmt.Printf("  Response Size per Request:\t%d bytes.\n", r.sizeTotal/int64(len(r.lats)))
+func (r *report) update(s *stat, res *result) {
+	if res.err != nil {
+		s.errorDist[res.err.Error()]++
+		s.errorCount.Incr(1)
+	} else {
+		s.lats = append(s.lats, res.duration.Seconds())
+		s.avgTotal += res.duration.Seconds()
+		s.statusCodeDist[res.statusCode]++
+		if res.contentLength > 0 {
+			s.sizeTotal += res.contentLength
 		}
-		r.printStatusCodes()
-		r.printHistogram()
-		r.printLatencies()
-	}
-
-	if len(r.errorDist) > 0 {
-		r.printErrors()
 	}
 }
 
-func (r *report) printCSV() {
-	for i, val := range r.lats {
-		fmt.Printf("%v,%4.4f\n", i+1, val)
+func (r *report) printStat(s *stat) {
+	sort.Float64s(s.lats)
+
+	var avgSizeTotal int64 = 0
+	if len(s.lats) > 0 {
+		s.rps = float64(len(s.lats)) / (float64)(s.tick)
+		s.average = s.avgTotal / float64(len(s.lats))
+		s.fastest = s.lats[0] * 1000
+		s.slowest = s.lats[len(s.lats)-1] * 1000
+		avgSizeTotal = s.sizeTotal / int64(len(s.lats))
+	} else {
+		s.fastest = 0
+		s.slowest = 0
+	}
+
+	var now string
+	if s.tick == 30 {
+		now = " [ 30Sec ]"
+	} else {
+		now = time.Now().Local().Round(time.Second).Format("  15:04:05")
+	}
+
+	line := fmt.Sprintf("%s   %6.0f     %6.0f       %6d      %6.0f       %6.0f           %d",
+		now,
+		s.rps,
+		s.average*1000,
+		s.errorCount.Val(),
+		s.fastest,
+		s.slowest,
+		avgSizeTotal,
+	)
+
+	if s.tick == 30 {
+		fmt.Println(color.Blue(line))
+	} else {
+		fmt.Println(line)
 	}
 }
 
 // Prints percentile latencies.
 func (r *report) printLatencies() {
+	s := r.total
 	pctls := []int{10, 25, 50, 75, 90, 95, 99}
 	data := make([]float64, len(pctls))
 	j := 0
-	for i := 0; i < len(r.lats) && j < len(pctls); i++ {
-		current := i * 100 / len(r.lats)
+	for i := 0; i < len(s.lats) && j < len(pctls); i++ {
+		current := i * 100 / len(s.lats)
 		if current >= pctls[j] {
-			data[j] = r.lats[i]
+			data[j] = s.lats[i]
 			j++
 		}
 	}
@@ -135,18 +189,31 @@ func (r *report) printLatencies() {
 }
 
 func (r *report) printHistogram() {
-	bc := 10
+	fmt.Printf("\nResponse       time   histogram:\n")
+	s := r.total
+	if len(s.lats) <= 0 {
+		fmt.Println("  no data")
+		return
+	}
+	sort.Float64s(s.lats)
+	s.fastest = s.lats[0]
+	s.slowest = s.lats[len(s.lats)-1]
+	bc := 12
 	buckets := make([]float64, bc+1)
 	counts := make([]int, bc+1)
-	bs := (r.slowest - r.fastest) / float64(bc)
-	for i := 0; i < bc; i++ {
-		buckets[i] = r.fastest + bs*float64(i)
+	//bs := (s.slowest - s.fastest) / float64(bc)
+	buckets[0] = 0.01
+	buckets[1] = 0.05
+	for i := 2; i < bc; i++ {
+		//buckets[i] = s.fastest + bs*float64(i)
+		buckets[i] = (float64)(i+1) * 0.1
 	}
-	buckets[bc] = r.slowest
+	buckets[bc] = s.slowest
+	last_index := len(buckets) - 1
 	var bi int
 	var max int
-	for i := 0; i < len(r.lats); {
-		if r.lats[i] <= buckets[bi] {
+	for i := 0; i < len(s.lats); {
+		if s.lats[i] <= buckets[bi] {
 			i++
 			counts[bi]++
 			if max < counts[bi] {
@@ -154,30 +221,37 @@ func (r *report) printHistogram() {
 			}
 		} else if bi < len(buckets)-1 {
 			bi++
+		} else {
+			i++
+			counts[last_index]++
+			if max < counts[last_index] {
+				max = counts[last_index]
+			}
 		}
 	}
-	fmt.Printf("\nResponse time histogram:\n")
 	for i := 0; i < len(buckets); i++ {
 		// Normalize bar lengths.
 		var barLen int
 		if max > 0 {
 			barLen = counts[i] * 40 / max
 		}
-		fmt.Printf("  %4.3f [%v]\t|%v\n", buckets[i], counts[i], strings.Repeat(barChar, barLen))
+		fmt.Printf("  %6.0f [%10d]\t|%v\n", buckets[i]*1000, counts[i], strings.Repeat(barChar, barLen))
 	}
 }
 
 // Prints status code distribution.
 func (r *report) printStatusCodes() {
+	s := r.total
 	fmt.Printf("\nStatus code distribution:\n")
-	for code, num := range r.statusCodeDist {
+	for code, num := range s.statusCodeDist {
 		fmt.Printf("  [%d]\t%d responses\n", code, num)
 	}
 }
 
 func (r *report) printErrors() {
-	fmt.Printf("\nError distribution:\n")
-	for err, num := range r.errorDist {
+	s := r.total
+	fmt.Printf("\nError distribution: %d\n", s.errorCount.Val())
+	for err, num := range s.errorDist {
 		fmt.Printf("  [%d]\t%s\n", num, err)
 	}
 }

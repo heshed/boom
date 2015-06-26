@@ -19,9 +19,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
-
-	"github.com/rakyll/pb"
 )
 
 type result struct {
@@ -45,9 +44,12 @@ type ReqOpts struct {
 }
 
 // Creates a req object from req options
-func (r *ReqOpts) Request() *http.Request {
-	req, _ := http.NewRequest(r.Method, r.URL, strings.NewReader(r.Body))
-	req.Header = r.Header
+func (r *ReqOpts) Request(body *string) *http.Request {
+	url := r.URL
+	if *body != "" {
+		url += *body
+	}
+	req, _ := http.NewRequest(r.Method, url, strings.NewReader(r.Body))
 
 	// update the Host value in the Request - this is used as the host header in any subsequent request
 	req.Host = r.OriginalHost
@@ -57,6 +59,21 @@ func (r *ReqOpts) Request() *http.Request {
 	}
 	return req
 }
+
+type Counter uint64
+
+func (c *Counter) Incr(val uint64) {
+	atomic.AddUint64((*uint64)(c), val)
+}
+
+func (c *Counter) Val() uint64 {
+	return atomic.LoadUint64((*uint64)(c))
+}
+
+func (c *Counter) Zero() {
+	atomic.StoreUint64((*uint64)(c), 0)
+}
+
 
 type Boomer struct {
 	// Req represents the options of the request to be made.
@@ -92,13 +109,8 @@ type Boomer struct {
 	// Optional.
 	ProxyAddr *url.URL
 
-	bar     *pb.ProgressBar
-	results chan *result
-}
+	BodyFile       string
+	BodyReader 	   *Reader
 
-func newPb(size int) (bar *pb.ProgressBar) {
-	bar = pb.New(size)
-	bar.Format("Bom !")
-	bar.Start()
-	return
+	SentCounter    Counter
 }
